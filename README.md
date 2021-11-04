@@ -10,7 +10,7 @@ Sample Home Assistant view of battery, and energy consumption from last four com
 
 State: fairly experimental. Stable code, but requires some effort to install
 
-The Python code requires a Bluetooth connected serial connection to the car. I am udsing a USB dongle, and a 5 meter cable, as the Raspberry is out of car range. The code works well, and reconnects fully automated, when the car leaves and returns.
+The Python code requires a Bluetooth connected serial connection to the car. I am using a USB dongle, and a 5 meter cable, as the Raspberry is out of car range. The code works well, and reconnects fully automated, when the car leaves and returns. You need to fit your car with a Bluetooth OBD2/OBDII dongle, same type as is described here: https://canze.fisch.lu/hardware/ 
 
 On the Home Assistant side you need to have MQTT installed to receive data, and you need to add this to configuration.yaml to receive the data:
 
