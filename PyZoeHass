@@ -1,0 +1,230 @@
+import serial
+import datetime
+import time
+import paho.mqtt.client as mqtt
+import paho.mqtt.publish as publish
+
+# read data from a Renault Zoe and publish it to Home Assistant
+# Typical cycle:
+#
+# System starts, initializes serial connection
+#    1 car arrives, connect
+#    2 Read out odometer, car fully awake,agressive polling
+#    3 Read out stats, first two sets fast, then slow down
+#    4 Car goes to sleep
+#    5 Car is charged, read out stats
+#    6 Car leaves, start over
+
+#commute
+comfrom = 73
+comto = 79
+
+# Home Automation connection
+broker = '127.0.0.1'
+state_topic = 'home-assistant/car'
+delay = 10
+# Send messages in a loop
+client = mqtt.Client("ha-client")
+client.connect(broker)
+client.loop_start()
+
+# serial is nificky
+class serialbroken(Exception): pass
+debug = False
+
+dateTimeObj = datetime.datetime.now()
+timestampStr = dateTimeObj.strftime("%d-%b-%Y (%H:%M:%S.%f)")
+print('Startup : ', timestampStr)
+elm = serial.Serial("/dev/rfcomm0", 38400, timeout=5)
+Hassstatus = "Starting up"
+lastODO=0
+lastkWh=0
+kWh=0
+soh=0
+lasttripKM=0
+lasstripkWh=0
+client.publish('home-assistant/lastkWh',23)
+def connect():
+    global Hassstatus
+    #client.publish('home-assistant/car',"Away")
+    while Hassstatus !="Sleeping" :
+        try :  
+            global elm
+            elm.write(b"ATZ\r")  # reset all
+            s=  elm.read_until(b"\r\rn").decode()
+            print(s[6:11])
+            if s[6:11]=="ELM32" :
+                print ("Connected to ELM")
+                i=0 # count number of OK's as we set up communication
+                # https://canze.fisch.lu/dongle-test-script/
+                elm.write(b"ATE0\r")  # line feeds on
+                    
+                s=elm.read_until(b"\r\n").decode()
+                               
+                if "OK" in s :
+                    i+=1
+                elm.write(b"ATS0\r")  #
+                s=elm.read_until(b"\r\n").decode()
+                if "OK" in s :
+                    i+=1
+                elm.write(b"atsp6\r")
+                s=(elm.read_until(b"\r\n").decode())
+                if "OK" in s :
+                    i+=1
+                elm.write(b"atat1\r")
+                s=elm.read_until(b"\r\n").decode()
+                if "OK" in s :
+                    i+=1
+                elm.write(b"atcaf0\r")
+                s=elm.read_until(b"\r\n").decode()
+                if "OK" in s :
+                    i+=1
+                elm.write(b"atsh7e4\r")
+                s=elm.read_until(b"\r\n").decode()
+                if "OK" in s :
+                    i+=1
+                elm.write(b"atfcsh7e4\r")
+                s=elm.read_until(b"\r\n").decode()
+                if "OK" in s :
+                    i+=1
+                if i==7 : #all ok, we have a good connection
+                    Hassstatus = "Sleeping"
+                    client.publish('home-assistant/car',"Home")
+              
+        except:
+              print("No connection")
+              time.sleep(20) #we poll agressively, as we only have two minutes to read data after arrival
+              try:
+                  elm = serial.Serial("/dev/rfcomm0", 38400, timeout=5) 
+              except:
+                  print("Still lost connection")
+                  
+def ReadOBDII(field,startbyte,endbyte,factor):
+    for x in range(3):
+        try :
+               #print("read obd "+ str(x))
+               elm.write(b"0322"+bytes(field, 'utf-8')+b"\r")
+               s=(elm.read_until(b"\r\n").decode())
+               #print(s)
+               i = int(s[startbyte:endbyte],16)
+               #print(i*factor)
+               return (i*factor)
+        except ValueError:
+                
+                if x==3 :
+                    print("Data corrupted, third attempt")
+                    raise(serialbroken) #after three sets of corrupted data we give up
+                
+        except :
+                print("Serial disconnected")
+                client.publish('home-assistant/car',"Away")
+                raise(serialbroken)
+        
+
+    
+    # decode https://github.com/fesch/CanZE/blob/2329e2f1bf2c043174cef45afbb7270f44642b0a/app/src/main/assets/ZOE/EVC_Fields.csv
+client.publish('home-assistant/car',"Away")
+while True :
+    
+#7EC,24,47,1,0,0,km, 222006,622006,ff,($2006) Total vehicle distance
+# Flow Control 7EC is answer to 7E4 flow control
+#position [10:14] capped at FF
+#7EC,24,39,.02,0,2,%,222002,622002,ff,($2002) State Of Charge (SOC) HV battery
+# position [8:12] capped at FF
+#7EC,24,31,1,0,0,%,  223206,623206,ff,($3206) State Of Health (SOH) HV battery
+# position [8:10] capped at FF
+
+#    1 car arrives, connect
+    connect()
+#    2 Read out odometer, car fully awake
+    try :
+        ODO = ReadOBDII("2006",10,14,1)
+        client.publish('home-assistant/ODO',ODO)
+        print(str(ODO)+" km ODO")
+        
+        while ODO  > 0 :
+            soc = ReadOBDII("2002",8,12,0.02)
+            soh = ReadOBDII("3206",8,10,1)
+    #    3 Read out stats
+
+            while soc != 0 and isinstance(soc,float) :
+                #global kWh
+                client.publish('home-assistant/SOC',round(int(soc)))
+                client.publish('home-assistant/SOH',soh)
+                soc = ReadOBDII("2002",8,12,0.02)
+                soh = ReadOBDII("3206",8,10,1)
+                ODO = ReadOBDII("2006",10,14,1)
+                Hassstatus = "Wake"
+                oldkWh=kWh
+                kWh = ReadOBDII("320c",8,12,0.005)
+                client.publish('home-assistant/kWh',kWh or oldkWh)
+                
+               # private static final String SID_EVC_TractionBatteryVoltage = "7ec.623203.24"; //  (EVC)
+               # private static final String SID_EVC_TractionBatteryCurrent = "7ec.623204.24"; //  (EVC)
+               # private static final String SID_MaxCharge = "7bb.6101.336";
+               # elm.write(b"0322503e\r")  # amps gang med 0,1 og ladestroemmen er kendt
+                #chargeamps = ReadOBDII("3203",8,12,1)
+                #chargeamps = ReadOBDII("3204",10,12,0.0625)
+                #chargevolts = ReadOBDII("2004",8,12,0.5)
+                #print(chargevolts)
+                #chargevolts = ReadOBDII("3485",8,12,0.5)
+                #print(chargevolts)
+                #chargeamps = ReadOBDII("3110",8,12,1)
+                #chargeamps = ReadOBDII("3113",8,12,1)
+                #chargeamps = ReadOBDII("3204",8,12,1)
+                #chargeamps = ReadOBDII("3484",8,12,1)
+                if (ODO != lastODO)  :
+                    print("updating lasttrip, ODO: "+str(ODO))
+                    print("updating lasttrip, last: "+str(lastODO))
+                    print("updating lasttrip, kWh: "+str(kWh))
+                    print("updating lasttrip, last: "+str(lastkWh))
+                    
+                    lasttripKM=ODO-lastODO
+                    lasttripkWh=lastkWh-kWh
+                    lastkWh=kWh #reset for next trip
+                    lastODO=ODO #reset for next trip
+                    if lasttripKM > comfrom and lasttripKM < comto :
+                        client.publish('home-assistant/commutekm',round(lasttripKM))
+                        client.publish('home-assistant/commutekWh',round(10*lasttripkWh)/10)
+                    print("updated lasttrip")
+                    if lasttripkWh > 0 : # avoid first time system runs
+                        client.publish('home-assistant/lastkm',round(lasttripKM))
+                        print("lasttrip: "+str(lasttripKM))
+                        client.publish('home-assistant/lastkWh',round(10*lasttripkWh)/10)
+                if (kWh is not None) and (kWh > oldkWh):
+                    oldkWh=kWh # oldkWh this session
+                    lastkWh=kWh # lastkWh for next session
+                    client.publish('home-assistant/car',"Charging")
+                    time.sleep(60)
+                else:
+                    if debug :
+                        client.publish('home-assistant/car',"Home, wake")
+                    else :
+                        client.publish('home-assistant/car',"Home")
+
+                    time.sleep(50)
+                
+                #    Hassstatus = "Car charging"
+                #    print("Car charging")
+                    
+#    4 Car goes to sleep
+            # SOC is null or 0, so we are sleeping
+            if Hassstatus != "Sleeping" :
+                client.publish('home-assistant/car',"Home")
+            Hassstatus = "Sleeping"
+            
+    except serialbroken:
+        client.publish('home-assistant/car',"Away")
+        print("broken")
+    Hassstatus ="Away" 
+    connect()
+    print("broken2")
+    
+    
+
+# decode https://github.com/fesch/CanZE/blob/2329e2f1bf2c043174cef45afbb7270f44642b0a/app/src/main/assets/ZOE/EVC_Fields.csv
+
+print ("closing")
+
+
+elm.close()
